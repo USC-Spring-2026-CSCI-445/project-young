@@ -13,8 +13,8 @@ from sensor_msgs.msg import LaserScan
 from tf.transformations import euler_from_quaternion
 
 # Import your existing implementations
-from lab8_9 import Map, ParticleFilter, angle_to_neg_pi_to_pi  # :contentReference[oaicite:2]{index=2}
-from lab10 import RrtPlanner, PIDController as WaypointPID, GOAL_THRESHOLD  # :contentReference[oaicite:3]{index=3}
+from lab8_9_starter import Map, ParticleFilter, angle_to_neg_pi_to_pi  # :contentReference[oaicite:2]{index=2}
+from lab10_starter import RrtPlanner, PIDController as WaypointPID, GOAL_THRESHOLD  # :contentReference[oaicite:3]{index=3}
 
 
 class PFRRTController:
@@ -180,12 +180,57 @@ class PFRRTController:
           - If obstacle close in front, back up and rotate.
         After each motion, apply PF measurement updates and check convergence.
         """
-        
+
         ######### Your code starts here #########
+        CONFIDENCE_THRESHOLD = 0.20
+        MIN_STEPS = 20
+        FRONT_OBS_THRESHOLD = 0.45
+        FORWARD_STEP = 0.20
+
+        for step in range(1, max_steps + 1):
+            if rospy.is_shutdown():
+                return
+
+            # After each motion, apply PF measurement updates and check convergence.
+            self.take_measurements()
+            self._pf.visualize_particles()
+            self._pf.visualize_estimate()
+
+            try:
+                xs = [p.x for p in self._pf._particles]
+                ys = [p.y for p in self._pf._particles]
+                x_std = float(np.std(xs))
+                y_std = float(np.std(ys))
+            except Exception:
+                x_std, y_std = float("inf"), float("inf")
+
+            if step >= MIN_STEPS and x_std < CONFIDENCE_THRESHOLD and y_std < CONFIDENCE_THRESHOLD:
+                rospy.loginfo(f"PF converged (std x={x_std:.3f}, y={y_std:.3f})")
+                return
+
+            # Simple exploration policy based on front range
+            scan = self.laserscan
+            if scan is None or not scan.ranges:
+                self.rate.sleep()
+                continue
+
+            idx0 = int(round((0.0 - scan.angle_min) / scan.angle_increment))
+            idx0 = max(0, min(len(scan.ranges) - 1, idx0))
+            front = scan.ranges[idx0]
+            if front is None or np.isinf(front) or math.isnan(front) or front <= 0:
+                front = float(getattr(scan, "range_max", 10.0))
+
+            if float(front) < FRONT_OBS_THRESHOLD:
+                self.move_forward(-0.10)
+                self.rotate_in_place(pi / 2)
+            else:
+                self.move_forward(FORWARD_STEP)
+
+            self.rate.sleep()
+
+        rospy.logwarn("PF did not converge within max_steps; continuing anyway.")
 
         ######### Your code ends here #########
-
-        
 
     # ----------------------------------------------------------------------
     # Phase 2: Planning with RRT
@@ -195,6 +240,22 @@ class PFRRTController:
         Generate a path using RRT from PF-estimated start to known goal.
         """
         ######### Your code starts here #########
+        x, y, _ = self._pf.get_estimate()
+        start = {"x": float(x), "y": float(y)}
+        goal = {"x": float(self.goal_position["x"]), "y": float(self.goal_position["y"])}
+
+        plan, graph = self._planner.generate_plan(start, goal)
+
+        if plan is None or len(plan) == 0:
+            raise RuntimeError(f"RRT could not find a plan from {start} to {goal}.")
+
+        self.plan = plan
+        self.current_wp_idx = 0
+
+        if hasattr(self._planner, "visualize_plan"):
+            self._planner.visualize_plan(plan)
+        if hasattr(self._planner, "visualize_graph"):
+            self._planner.visualize_graph(graph)
 
         ######### Your code ends here #########
 
@@ -207,6 +268,51 @@ class PFRRTController:
         Keep updating PF along the way.
         """
         ######### Your code starts here #########
+        if not self.plan:
+            raise RuntimeError("No plan available. Call plan_with_rrt() first.")
+
+        waypoint_tolerance = GOAL_THRESHOLD
+        EMERGENCY_STOP_DIST = 0.35
+
+        try:
+            while not rospy.is_shutdown() and self.current_wp_idx < len(self.plan):
+                self.take_measurements()
+                self._pf.visualize_particles()
+                self._pf.visualize_estimate()
+
+                # Emergency stop if obstacle too close in front
+                scan = self.laserscan
+                if scan is not None:
+                    rel = (0.0 - scan.angle_min) % (2 * pi)
+                    idx0 = int(round(rel / scan.angle_increment))
+                    idx0 = max(0, min(len(scan.ranges) - 1, idx0))
+                    d0 = scan.ranges[idx0]
+                    if not np.isinf(d0) and not math.isnan(d0) and d0 < EMERGENCY_STOP_DIST:
+                        self.cmd_pub.publish(Twist())
+                        self.rotate_in_place(pi / 6)
+                        continue
+
+                x, y, theta = self._pf.get_estimate()
+                wp = self.plan[self.current_wp_idx]
+                dx = float(wp["x"]) - float(x)
+                dy = float(wp["y"]) - float(y)
+                dist_err = sqrt(dx * dx + dy * dy)
+                ang_err = angle_to_neg_pi_to_pi(atan2(dy, dx) - theta)
+
+                if dist_err < waypoint_tolerance:
+                    self.current_wp_idx += 1
+                    self.cmd_pub.publish(Twist())
+                    self.rate.sleep()
+                    continue
+
+                t = rospy.Time.now().to_sec()
+                cmd = Twist()
+                cmd.linear.x = float(self.linear_pid.control(dist_err, t))
+                cmd.angular.z = float(self.angular_pid.control(ang_err, t))
+                self.cmd_pub.publish(cmd)
+                self.rate.sleep()
+        finally:
+            self.cmd_pub.publish(Twist())
 
         ######### Your code ends here #########
 
@@ -237,10 +343,10 @@ if __name__ == "__main__":
 
     # Build map + PF + RRT
     map_obj = Map(obstacles, map_aabb)
-    num_particles = 200
+    num_particles = 240
     translation_variance = 0.003
-    rotation_variance = 0.03
-    measurement_variance = 0.35
+    rotation_variance = 0.02
+    measurement_variance = 0.25
 
     pf = ParticleFilter(
         map_obj,
