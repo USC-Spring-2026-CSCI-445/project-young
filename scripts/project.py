@@ -343,7 +343,7 @@ if __name__ == "__main__":
 
     # Build map + PF + RRT
     map_obj = Map(obstacles, map_aabb)
-    num_particles = 240
+    num_particles = 300
     translation_variance = 0.003
     rotation_variance = 0.02
     measurement_variance = 0.25
